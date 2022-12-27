@@ -1,0 +1,22 @@
+[package]
+name = "mkimg"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aurimas Blažulionis <0x60@pm.me>"]
+description = "Simple tool to create raw disk images"
+documentation = "https://docs.rs/mkimg"
+readme = "README.md"
+repository = "https://github.com/h33p/mkimg"
+license = "MIT"
+keywords = [ "mkimg", "mkfs", "fat32", "image" ]
+categories = [ "command-line-utilities", "filesystem" ]
+
+[dependencies]
+anyhow = "1.0.68"
+clap = { version = "4.0.32", features = ["cargo", "derive"] }
+env_logger = "0.10.0"
+fatfs = "0.3.5"
+fscommon = "0.1.1"
+gpt = "3.0.0"
+log = "0.4.17"
+mbrman = "0.5.1"
