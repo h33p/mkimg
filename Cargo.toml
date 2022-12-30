@@ -1,6 +1,6 @@
 [package]
 name = "mkimg"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Aurimas Blažulionis <0x60@pm.me>"]
 description = "Simple tool to create raw disk images"

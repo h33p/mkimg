@@ -15,7 +15,7 @@ struct Args {
     #[arg(value_enum, short, long, default_value = "none")]
     partition_table: PartitionTable,
     /// Filesystem for the image
-    #[arg(value_enum, short, long, default_value = "fat32")]
+    #[arg(value_enum, short, long, default_value = "vfat")]
     filesystem: Filesystem,
     /// Output image path
     #[arg(short, long)]
@@ -40,16 +40,87 @@ enum PartitionTable {
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
 enum Filesystem {
-    #[value(alias("fat32"))]
-    Fat32,
+    #[value(alias("vfat"), alias("fat32"))]
+    Vfat,
 }
+
+impl Filesystem {
+    fn estimate_size(&self, input_dir: &Path) -> anyhow::Result<u64> {
+        Ok(match self {
+            Self::Vfat => {
+                // Estimate size for fat32 images. They will be sufficient for smaller images.
+                let mut files = 0;
+                let mut number_of_fats = 3;
+                let mut dir_entries = 1u64;
+
+                let dir_entry_count = (FAT_BYTES_PER_CLUSTER / 32) as u64;
+                let dir_entry_align = dir_entry_count - 1;
+
+                walk_dir(
+                    input_dir,
+                    input_dir,
+                    dir_entries,
+                    &mut |cur_path, _, dir_entries, _| {
+                        *dir_entries += 1;
+                        // Long file name
+                        let file_len = cur_path.file_name().map(|f| f.len() as u64).unwrap_or(0);
+                        let lfn_entries = (file_len + 12) / 13;
+                        *dir_entries += lfn_entries;
+
+                        // Including . and .. entries
+                        Ok(3)
+                    },
+                    &mut |cur_path, _, dir_entries, metadata| {
+                        files += 1;
+                        *dir_entries += 1;
+                        // Number of FAT
+                        number_of_fats +=
+                            (metadata.len() + FAT_ALIGN as u64) / FAT_BYTES_PER_CLUSTER as u64;
+                        // Long file name
+                        let file_len = cur_path.file_name().map(|f| f.len() as u64).unwrap_or(0);
+                        let lfn_entries = (file_len + 12) / 13;
+                        *dir_entries += lfn_entries;
+                        Ok(())
+                    },
+                    &mut |_, counted_entries| {
+                        // Final dir entry alignment
+                        dir_entries = (dir_entries + dir_entry_align) & !dir_entry_align;
+                        dir_entries += (counted_entries + dir_entry_align) & !dir_entry_align;
+                        Ok(())
+                    },
+                )?;
+
+                // fatrs implementation reserves 8 sectors
+                let reserved_sectors = FAT_BYTES_PER_SECTOR as u64 * 8;
+
+                let size = number_of_fats * FAT_BYTES_PER_CLUSTER as u64;
+
+                number_of_fats += 3;
+
+                debug!(
+                    r"
+    size: {size:x}
+    number_of_fats: {number_of_fats:x}
+    dir_entries: {dir_entries}"
+                );
+
+                size + number_of_fats * 4 * 2 + reserved_sectors + dir_entries * 32
+            }
+        })
+    }
+}
+
+const FAT_BYTES_PER_CLUSTER: usize = 512;
+const FAT_ALIGN: usize = FAT_BYTES_PER_CLUSTER - 1;
+const FAT_BYTES_PER_SECTOR: usize = 512;
 
 fn walk_dir<T>(
     root: &Path,
     cur_path: &Path,
-    cur_entry: &T,
-    dir_cb: &mut impl FnMut(&Path, &Path, &T, &Metadata) -> io::Result<T>,
-    file_cb: &mut impl FnMut(&Path, &Path, &T, &Metadata) -> io::Result<()>,
+    mut cur_entry: T,
+    dir_cb: &mut impl FnMut(&Path, &Path, &mut T, &Metadata) -> io::Result<T>,
+    file_cb: &mut impl FnMut(&Path, &Path, &mut T, &Metadata) -> io::Result<()>,
+    close_cb: &mut impl FnMut(&Path, T) -> io::Result<()>,
 ) -> io::Result<()> {
     for entry in fs::read_dir(cur_path)? {
         let entry = entry?;
@@ -57,17 +128,20 @@ fn walk_dir<T>(
         let path = entry.path();
         if let Ok(short_path) = path.strip_prefix(root) {
             if metadata.is_dir() {
-                let cur_entry = dir_cb(&path, &short_path, cur_entry, &metadata)?;
+                let new_entry = dir_cb(&path, &short_path, &mut cur_entry, &metadata)?;
                 std::mem::drop(metadata);
-                walk_dir(root, &path, &cur_entry, dir_cb, file_cb).unwrap();
+                walk_dir(root, &path, new_entry, dir_cb, file_cb, close_cb).unwrap();
             } else {
-                file_cb(&path, &short_path, cur_entry, &metadata)?;
+                file_cb(&path, &short_path, &mut cur_entry, &metadata)?;
                 std::mem::drop(metadata);
             }
         } else {
             error!("walk_dir: {path:?}");
         }
     }
+
+    close_cb(cur_path, cur_entry)?;
+
     Ok(())
 }
 
@@ -79,51 +153,24 @@ fn main() -> anyhow::Result<()> {
     let partition_size = if let Some(size) = args.size {
         size
     } else {
-        let mut dirs = 0;
-        let mut size = 0;
-        let mut files = 0;
-
-        walk_dir(
-            &args.input_dir,
-            &args.input_dir,
-            &(),
-            &mut |_, _, _, _| {
-                dirs += 1;
-                Ok(())
-            },
-            &mut |_, _, _, metadata| {
-                files += 1;
-                size += metadata.len();
-                Ok(())
-            },
-        )?;
-
-        debug!("size: {size:x} files: {files} dirs: {dirs}");
-
-        size + 0x10000 + (files + dirs) * 512
+        args.filesystem.estimate_size(&args.input_dir)?
     };
 
     debug!("Partition size: {partition_size:x}");
 
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(args.output_path)?;
+
     let fat_slice = match args.partition_table {
         PartitionTable::None => {
-            let file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .open(args.output_path)?;
-
             file.set_len(partition_size)?;
 
             Box::new(file) as Box<dyn ReadWriteSeek>
         }
         PartitionTable::Mbr => {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .open(args.output_path)?;
-
             // Align to 512 byte sector
             let partition_size = (partition_size + 0x1ff) & !0x1ff;
 
@@ -166,12 +213,6 @@ fn main() -> anyhow::Result<()> {
 
             debug!("Total size: {total_size:x}");
 
-            let mut file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .open(args.output_path)?;
-
             file.set_len(total_size)?;
 
             let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(
@@ -212,30 +253,34 @@ fn main() -> anyhow::Result<()> {
 
     format_volume(
         &mut buf_stream,
-        FormatVolumeOptions::new().fat_type(FatType::Fat32),
+        FormatVolumeOptions::new().bytes_per_cluster(FAT_BYTES_PER_CLUSTER as u32),
     )?;
 
     let fs = FileSystem::new(buf_stream, FsOptions::new())?;
 
     let root_dir = fs.root_dir();
 
+    let mut cnt = 0;
+
     walk_dir(
         &args.input_dir,
         &args.input_dir,
-        &root_dir,
+        root_dir,
         &mut |_, short_path, parent_dir, _| {
             let name = short_path.file_name().unwrap().to_str().unwrap();
             info!("DIR: {name}");
             Ok(parent_dir.create_dir(name)?)
         },
-        &mut |path, short_path, parent_dir, _| {
+        &mut |path, short_path, parent_dir: &mut Dir<_>, _| {
             let name = short_path.file_name().unwrap().to_str().unwrap();
-            info!("FILE: {name}");
+            cnt += 1;
+            info!("FILE {cnt}: {name}");
             let mut orig_file = File::open(path)?;
             let mut file = parent_dir.create_file(name)?;
             std::io::copy(&mut orig_file, &mut file)?;
             Ok(())
         },
+        &mut |_, _| Ok(()),
     )?;
 
     Ok(())

@@ -10,13 +10,13 @@ cargo install mkimg
 
 ## Usage
 
-Create a simple fat32 image without additional partition table:
+Create a simple vfat image without additional partition table:
 
 ```
 $ mkimg -i directory -o image.raw
 ```
 
-Create a fat32 image with GPT partition table:
+Create a vfat image with GPT partition table:
 
 ```
 $ mkimg -i directory -o image.raw -p gpt
@@ -36,7 +36,7 @@ Options:
   -p, --partition-table <PARTITION_TABLE>
           Partition table to use. Image size may be extended to fit it [default: none] [possible values: gpt, mbr, none]
   -f, --filesystem <FILESYSTEM>
-          Filesystem for the image [default: fat32] [possible values: fat32]
+          Filesystem for the image [default: vfat] [possible values: vfat]
   -o, --output-path <OUTPUT_PATH>
           Output image path
   -s, --size <SIZE>
