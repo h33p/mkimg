@@ -26,6 +26,9 @@ struct Args {
     /// Whether image should be bootable
     #[arg(short, long)]
     bootable: bool,
+    /// Whether to follow symlinks or skip them
+    #[arg(short, long)]
+    link_follow: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -45,7 +48,7 @@ enum Filesystem {
 }
 
 impl Filesystem {
-    fn estimate_size(&self, input_dir: &Path) -> anyhow::Result<u64> {
+    fn estimate_size(&self, input_dir: &Path, link_follow: bool) -> anyhow::Result<u64> {
         Ok(match self {
             Self::Vfat => {
                 // Estimate size for fat32 images. They will be sufficient for smaller images.
@@ -59,6 +62,7 @@ impl Filesystem {
                 walk_dir(
                     input_dir,
                     input_dir,
+                    link_follow,
                     dir_entries,
                     &mut |cur_path, _, dir_entries, _| {
                         *dir_entries += 1;
@@ -117,6 +121,7 @@ const FAT_BYTES_PER_SECTOR: usize = 512;
 fn walk_dir<T>(
     root: &Path,
     cur_path: &Path,
+    link_follow: bool,
     mut cur_entry: T,
     dir_cb: &mut impl FnMut(&Path, &Path, &mut T, &Metadata) -> io::Result<T>,
     file_cb: &mut impl FnMut(&Path, &Path, &mut T, &Metadata) -> io::Result<()>,
@@ -130,10 +135,21 @@ fn walk_dir<T>(
             if metadata.is_dir() {
                 let new_entry = dir_cb(&path, &short_path, &mut cur_entry, &metadata)?;
                 std::mem::drop(metadata);
-                walk_dir(root, &path, new_entry, dir_cb, file_cb, close_cb).unwrap();
-            } else {
+                walk_dir(
+                    root,
+                    &path,
+                    link_follow,
+                    new_entry,
+                    dir_cb,
+                    file_cb,
+                    close_cb,
+                )
+                .unwrap();
+            } else if link_follow || !metadata.is_symlink() {
                 file_cb(&path, &short_path, &mut cur_entry, &metadata)?;
                 std::mem::drop(metadata);
+            } else {
+                warn!("Skipping symlink - {}", short_path.display());
             }
         } else {
             error!("walk_dir: {path:?}");
@@ -153,7 +169,8 @@ fn main() -> anyhow::Result<()> {
     let partition_size = if let Some(size) = args.size {
         size
     } else {
-        args.filesystem.estimate_size(&args.input_dir)?
+        args.filesystem
+            .estimate_size(&args.input_dir, args.link_follow)?
     };
 
     debug!("Partition size: {partition_size:x}");
@@ -265,6 +282,7 @@ fn main() -> anyhow::Result<()> {
     walk_dir(
         &args.input_dir,
         &args.input_dir,
+        args.link_follow,
         root_dir,
         &mut |_, short_path, parent_dir, _| {
             let name = short_path.file_name().unwrap().to_str().unwrap();
